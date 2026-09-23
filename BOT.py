@@ -2,17 +2,12 @@
 
 import os
 import sqlite3
-import asyncio
-import secrets
-import string
-import time
 import logging
 import html
 import urllib.request
 import urllib.parse
 import json
-import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from telegram import (
     Update,
@@ -21,12 +16,6 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import TimeoutException
-
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -55,13 +44,20 @@ SUPPORT_USERNAME = "@RZ_core"
 SECOND_BOT_TOKEN = os.getenv("SECOND_BOT_TOKEN", "").strip()
 
 # Chat ID مقصد در ربات دوم
-SECOND_CHAT_ID = "YOUR_SECOND_CHAT_ID"
+SECOND_CHAT_ID = os.getenv("SECOND_CHAT_ID", "").strip()
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-DB_NAME = os.getenv("DB_NAME", "cactus_vpn.db")
+DB_NAME = os.getenv(
+    "DB_NAME",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "cactus_vpn.db")
+)
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set. Configure it in the environment or GitHub Secrets.")
+
 
 # =========================================================
 # LOGGING
@@ -1792,6 +1788,7 @@ async def test_page(query):
 
 
 async def confirm_test(query):
+
     row = execute(
         """
         SELECT used_test
@@ -1802,62 +1799,37 @@ async def confirm_test(query):
         fetch=True
     )
 
-    if not row or row[0]["used_test"]:
+    if (
+        not row
+        or row[0]["used_test"]
+    ):
+
         await test_page(query)
+
         return
+
+    execute(
+        """
+        UPDATE users
+        SET used_test=1
+        WHERE id=?
+        """,
+        (query.from_user.id,)
+    )
 
     await query.edit_message_text(
         "╭━━━ 🎁 <b>تست رایگان</b> ━━━╮\n\n"
-        "⏳ <b>در حال ساخت تست شما...</b>\n\n"
+
+        "✅ <b>درخواست تست ثبت شد.</b>\n\n"
         "حجم: <b>50 MB</b>\n"
         "مدت: <b>1 روز</b>\n\n"
-        "لطفاً چند لحظه صبر کنید."
+
+        "درخواست شما برای ساخت سرویس ثبت شد."
         "\n\n╰━━━━━━━━━━━━━━━━━━╯",
-        parse_mode=ParseMode.HTML
+
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_home_keyboard()
     )
-
-    try:
-        # 50 MB in YouPanel's unit is 0.05.
-        test_plan = {
-            "volume": "50 MB",
-            "duration": "1 روز",
-        }
-        result = await asyncio.to_thread(create_youpanel_service, test_plan)
-
-        # Mark only after successful panel creation. This prevents a failed
-        # Selenium run from consuming the user's one allowed test.
-        execute(
-            """
-            UPDATE users
-            SET used_test=1
-            WHERE id=?
-            """,
-            (query.from_user.id,)
-        )
-
-        await query.edit_message_text(
-            "╭━━━ 🎁 <b>تست رایگان</b> ━━━╮\n\n"
-            "✅ <b>تست شما آماده شد.</b>\n\n"
-            "حجم: <b>50 MB</b>\n"
-            "مدت: <b>1 روز</b>\n\n"
-            f"👤 نام کاربری:\n<code>{esc(result['username'])}</code>\n\n"
-            "🔗 لینک اشتراک:\n"
-            f"<code>{esc(result['subscription_url'])}</code>"
-            "\n\n╰━━━━━━━━━━━━━━━━━━╯",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_home_keyboard()
-        )
-
-    except Exception as exc:
-        await query.edit_message_text(
-            "╭━━━ 🎁 <b>تست رایگان</b> ━━━╮\n\n"
-            "❌ <b>ساخت تست با خطا مواجه شد.</b>\n\n"
-            "تست شما مصرف نشد و می‌توانید دوباره تلاش کنید."
-            "\n\n╰━━━━━━━━━━━━━━━━━━╯",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_home_keyboard()
-        )
-        logging.exception("YOUPANEL FREE TEST FAILED: %s", exc)
 
 
 # =========================================================
@@ -2620,425 +2592,6 @@ async def admin_payments(query):
 # APPROVE PAYMENT
 # =========================================================
 
-
-# =========================================================
-# YOUPANEL SELENIUM CONNECTOR
-# =========================================================
-
-def _panel_url(address, port=""):
-    address = str(address or "").strip()
-    port = str(port or "").strip()
-
-    if not address:
-        raise RuntimeError("آدرس پنل خالی است.")
-
-    if not address.startswith(("http://", "https://")):
-        address = "http://" + address
-
-    address = address.rstrip("/")
-
-    # پشتیبانی از ساختار قدیمی address + port
-    if port:
-        try:
-            from urllib.parse import urlparse
-            parsed = urlparse(address)
-            if parsed.port is None:
-                address = f"{address}:{port}"
-        except Exception:
-            pass
-
-    return address
-
-
-def _panel_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1600,1200")
-    options.add_argument("--lang=fa-IR")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
-    return webdriver.Chrome(options=options)
-
-
-def _visible(driver, by, selector):
-    try:
-        for el in driver.find_elements(by, selector):
-            if el.is_displayed():
-                return el
-    except Exception:
-        pass
-    return None
-
-
-def _wait_any(driver, selectors, timeout=25):
-    end = time.time() + timeout
-    while time.time() < end:
-        for by, selector in selectors:
-            el = _visible(driver, by, selector)
-            if el:
-                return el
-        time.sleep(.25)
-    raise TimeoutException("Element not found: " + str(selectors))
-
-
-def _click(driver, el):
-    driver.execute_script(
-        "arguments[0].scrollIntoView({block:'center'});", el
-    )
-    try:
-        el.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", el)
-
-
-def _fill(driver, el, value):
-    driver.execute_script(
-        "arguments[0].scrollIntoView({block:'center'});", el
-    )
-    el.click()
-    el.clear()
-    el.send_keys(str(value))
-
-
-def _text_element(driver, texts):
-    for text_value in texts:
-        xpath = (
-            f"//*[normalize-space()={repr(text_value)}]"
-            f"|//*[contains(normalize-space(.),{repr(text_value)})]"
-        )
-        try:
-            for el in driver.find_elements(By.XPATH, xpath):
-                if el.is_displayed():
-                    return el
-        except Exception:
-            pass
-    return None
-
-
-def _click_text(driver, texts, timeout=25):
-    end = time.time() + timeout
-    while time.time() < end:
-        el = _text_element(driver, texts)
-        if el:
-            _click(driver, el)
-            return el
-        time.sleep(.25)
-    raise TimeoutException("Text not found: " + str(texts))
-
-
-def _new_panel_username():
-    return "cactus_" + "".join(
-        secrets.choice(string.ascii_letters + string.digits)
-        for _ in range(10)
-    )
-
-
-def _input_meta(el):
-    return " ".join([
-        el.get_attribute("name") or "",
-        el.get_attribute("id") or "",
-        el.get_attribute("placeholder") or "",
-        el.get_attribute("aria-label") or "",
-        el.get_attribute("title") or "",
-        el.get_attribute("data-testid") or "",
-        el.get_attribute("type") or "",
-    ]).strip().lower()
-
-
-def _find_labeled_input(driver, terms, timeout=30):
-    """Robustly find visible form input even when YouPanel uses React and no name/id."""
-    terms = [str(x).lower() for x in terms]
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, "input, textarea, [contenteditable='true']")
-            visible = []
-            for el in elements:
-                if not el.is_displayed() or not el.is_enabled():
-                    continue
-                visible.append(el)
-                meta = _input_meta(el)
-                if any(t in meta for t in terms):
-                    return el
-                eid = el.get_attribute("id") or ""
-                if eid:
-                    for lab in driver.find_elements(By.CSS_SELECTOR, f"label[for='{eid}']"):
-                        if lab.is_displayed() and any(t in (lab.text or '').lower() for t in terms):
-                            return el
-                try:
-                    parent_text = driver.execute_script(
-                        "let e=arguments[0],p=e.parentElement,out='';for(let i=0;i<6&&p;i++,p=p.parentElement){out+=' '+(p.innerText||'');}return out;", el
-                    ) or ""
-                    if any(t in parent_text.lower() for t in terms):
-                        return el
-                except Exception:
-                    pass
-            if visible:
-                non_search = [e for e in visible if (e.get_attribute('type') or 'text').lower() not in ('hidden','search')]
-                if len(non_search) == 1:
-                    return non_search[0]
-        except Exception:
-            pass
-        time.sleep(.25)
-    raise TimeoutException("Input not found for terms: " + str(terms))
-
-
-def _login_inputs(driver, timeout=30):
-    """Fallback for the YouPanel login form when its inputs have no useful attributes."""
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            inputs = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if e.is_displayed() and e.is_enabled()]
-            passwords = [e for e in inputs if (e.get_attribute('type') or '').lower() == 'password']
-            candidates = [e for e in inputs if (e.get_attribute('type') or 'text').lower() not in ('password','hidden','search')]
-            if passwords and candidates:
-                return candidates[0], passwords[0]
-        except Exception:
-            pass
-        time.sleep(.25)
-    raise TimeoutException("YouPanel login inputs were not found")
-
-def _set_input_value(driver, el, value):
-    """Set controlled inputs and fire the events frameworks normally listen for."""
-    driver.execute_script(
-        """
-        const el=arguments[0], value=arguments[1];
-        const setter=Object.getOwnPropertyDescriptor(el.__proto__, 'value')?.set;
-        if(setter){setter.call(el, value);} else {el.value=value;}
-        el.dispatchEvent(new Event('input',{bubbles:true}));
-        el.dispatchEvent(new Event('change',{bubbles:true}));
-        el.dispatchEvent(new Event('blur',{bubbles:true}));
-        """,
-        el, str(value)
-    )
-
-
-def _choose_expiry(driver, days):
-    """Use the panel's date picker rather than typing a date string into it."""
-    # Prefer the visible expiry field/button by metadata/nearby label.
-    field = _find_labeled_input(
-        driver,
-        ["تاریخ انقضا", "تاریخ پایان", "انقضا", "expiry", "expiration", "expires"],
-        timeout=10,
-    )
-    _click(driver, field)
-    time.sleep(.5)
-
-    target = datetime.now() + timedelta(days=int(days))
-    # Native/browser date inputs can be selected with keyboard even when the
-    # control is not text-editable. We do not send a formatted date string.
-    try:
-        field.send_keys("CTRL", "A")
-        field.send_keys("ARROWRIGHT")
-    except Exception:
-        pass
-
-    # Custom calendar: find a day button matching the target day. Restrict to
-    # visible buttons inside common calendar/dialog containers.
-    day = str(target.day)
-    candidates = []
-    for el in driver.find_elements(By.CSS_SELECTOR, "button,[role='button']"):
-        if not el.is_displayed():
-            continue
-        txt = (el.text or "").strip()
-        aria = (el.get_attribute("aria-label") or "").strip()
-        title = (el.get_attribute("title") or "").strip()
-        meta = f"{txt} {aria} {title}".lower()
-        if txt == day or aria == day or title == day:
-            candidates.append(el)
-        elif str(target.year) in meta and str(target.month) in meta and day in meta:
-            candidates.append(el)
-
-    # If a quick-duration button exists, it is safer than guessing a calendar
-    # day only when it exactly represents the requested duration.
-    quick = _text_element(driver, [f"+{days}d", f"+{days} روز"])
-    if quick:
-        _click(driver, quick)
-        return
-
-    if candidates:
-        # Prefer candidates inside a dialog/popover/calendar.
-        candidates.sort(key=lambda e: 0 if e.find_elements(By.XPATH, "ancestor::*[@role='dialog' or contains(@class,'calendar') or contains(@class,'datepicker')]") else 1)
-        _click(driver, candidates[0])
-        return
-
-    # Last safe UI fallback: focus the control and use calendar navigation keys,
-    # without assigning a date string directly.
-    try:
-        _click(driver, field)
-        for _ in range(max(0, int(days))):
-            field.send_keys("ARROWDOWN")
-        field.send_keys("ENTER")
-        return
-    except Exception as exc:
-        raise TimeoutException("Date picker opened but target date could not be selected") from exc
-
-
-def _choose_all(driver):
-    el = _text_element(driver, ["انتخاب همه", "Select all"])
-    if el:
-        _click(driver, el)
-        return
-    # Checkbox/label fallback.
-    for el in driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox'],label"):
-        meta = " ".join([
-            el.text or "", el.get_attribute("aria-label") or "",
-            el.get_attribute("title") or ""
-        ]).lower()
-        if "انتخاب همه" in meta or "select all" in meta:
-            _click(driver, el)
-            return
-
-
-def _subscription_from_page(driver, username):
-    # Direct links first.
-    for el in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
-        href = el.get_attribute("href") or ""
-        meta = " ".join([
-            el.text or "", el.get_attribute("title") or "",
-            el.get_attribute("aria-label") or "",
-            el.get_attribute("data-tooltip") or "", href
-        ]).lower()
-        if href.startswith(("http://", "https://")) and any(x in meta for x in ("subscription", "subscribe", "اشتراک", "sub")):
-            return href
-
-    # Click likely subscription/link/chain icon and inspect dialog/popover.
-    selectors = "button,[role='button'],a"
-    for el in driver.find_elements(By.CSS_SELECTOR, selectors):
-        if not el.is_displayed():
-            continue
-        meta = " ".join([
-            el.text or "", el.get_attribute("title") or "",
-            el.get_attribute("aria-label") or "",
-            el.get_attribute("data-tooltip") or "",
-            el.get_attribute("data-testid") or ""
-        ]).lower()
-        if not any(x in meta for x in ("subscription", "subscribe", "اشتراک", "لینک", "link", "chain")):
-            continue
-        try:
-            _click(driver, el)
-            time.sleep(.7)
-            for node in driver.find_elements(By.CSS_SELECTOR, "a[href],input,textarea"):
-                value = node.get_attribute("href") or node.get_attribute("value") or node.text or ""
-                if str(value).startswith(("http://", "https://")):
-                    return str(value).strip()
-        except Exception:
-            continue
-    raise RuntimeError(f"کاربر {username} ساخته شد، اما لینک Subscription پیدا نشد.")
-
-
-def create_youpanel_service(plan):
-    """Create a YouPanel user through the visible web UI (no API key)."""
-    rows = execute("SELECT * FROM panel WHERE id=1", fetch=True)
-    if not rows:
-        raise RuntimeError("اطلاعات پنل ثبت نشده است.")
-    panel = rows[0]
-    for field in ("address", "username", "password"):
-        if not panel[field]:
-            raise RuntimeError(f"فیلد {field} پنل خالی است.")
-
-    driver = None
-    username = _new_panel_username()
-    try:
-        driver = _panel_driver()
-        driver.get(_panel_url(panel["address"]))
-
-        # LOGIN: semantic selectors first, then the actual form structure.
-        try:
-            user_input = _find_labeled_input(driver, ["نام کاربری", "username", "email"], 8)
-            pass_input = _find_labeled_input(driver, ["گذرواژه", "رمز", "password"], 8)
-        except TimeoutException:
-            user_input, pass_input = _login_inputs(driver, 30)
-        _fill(driver, user_input, panel["username"])
-        _fill(driver, pass_input, panel["password"])
-        _click_text(driver, ["ورود", "Login"], 20)
-        WebDriverWait(driver, 30).until(lambda d: "login" not in d.current_url.lower() or _text_element(d, ["داشبورد", "Dashboard"]))
-
-        # SIDEBAR MUST BE OPENED FIRST.
-        opened = False
-        for el in driver.find_elements(By.CSS_SELECTOR, "button,[role='button']"):
-            meta = " ".join([el.get_attribute("aria-label") or "", el.get_attribute("title") or "", el.text or ""]).lower()
-            if any(x in meta for x in ("toggle", "sidebar", "menu", "منو", "باز کردن")):
-                try:
-                    _click(driver, el); opened = True; break
-                except Exception:
-                    pass
-        if not opened:
-            # Common hamburger fallback.
-            for el in driver.find_elements(By.CSS_SELECTOR, "button"):
-                aria = (el.get_attribute("aria-label") or "").lower()
-                if "menu" in aria or "sidebar" in aria:
-                    _click(driver, el); break
-
-        _click_text(driver, ["کاربران", "Users"], 25)
-        _click_text(driver, ["افزودن کاربر", "Add User"], 25)
-        _wait_any(driver, [
-            (By.XPATH, "//*[contains(normalize-space(.),'افزودن کاربر') or contains(normalize-space(.),'Add User')]")
-        ], 15)
-
-        # RANDOM USERNAME; remember it locally for the rest of this run.
-        username_input = _find_labeled_input(driver, ["نام کاربری را وارد کنید", "نام کاربری", "username"], 30)
-        _fill(driver, username_input, username)
-
-        # PANEL UNIT: 0.005 = 5MB, 0.05 = 50MB, 0.5 = 500MB, 5 = 5GB.
-        raw_volume = str(plan.get("volume") if hasattr(plan, "get") else plan["volume"] or "")
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", raw_volume.replace(",", "."))
-        if not m:
-            raise RuntimeError(f"حجم نامعتبر است: {raw_volume}")
-        number = float(m.group(1))
-        lower = raw_volume.lower()
-        if "mb" in lower or "مگ" in lower:
-            panel_volume = number / 1000.0
-        elif "gb" in lower or "گیگ" in lower:
-            panel_volume = number
-        else:
-            panel_volume = number
-        volume_value = f"{panel_volume:g}"
-        volume_input = _find_labeled_input(driver, ["حد مصرف داده", "مصرف داده", "حجم", "volume", "limit", "data limit"], 20)
-        _fill(driver, volume_input, volume_value)
-
-        duration = str(plan.get("duration") if hasattr(plan, "get") else plan["duration"] or "1")
-        dm = re.search(r"\d+", duration)
-        duration_days = int(dm.group()) if dm else 1
-        _choose_expiry(driver, duration_days)
-
-        # The panel requires selecting all groups before Create.
-        _choose_all(driver)
-        _click_text(driver, ["ایجاد", "Create"], 25)
-
-        # Find the exact generated username, not an arbitrary first row.
-        end = time.time() + 40
-        while time.time() < end:
-            el = _text_element(driver, [username])
-            if el:
-                _click(driver, el)
-                break
-            time.sleep(.4)
-        else:
-            raise TimeoutException(f"کاربر ساخته شده پیدا نشد: {username}")
-
-        time.sleep(.8)
-        return {"username": username, "subscription_url": _subscription_from_page(driver, username)}
-
-    except Exception:
-        if driver:
-            base = os.path.dirname(os.path.abspath(__file__))
-            try: driver.save_screenshot(os.path.join(base, "youpanel_error.png"))
-            except Exception: pass
-            try:
-                with open(os.path.join(base, "youpanel_error.html"), "w", encoding="utf-8") as f:
-                    f.write(driver.page_source)
-            except Exception: pass
-        raise
-    finally:
-        if driver:
-            try: driver.quit()
-            except Exception: pass
-
-
 async def approve_payment(
     query,
     context,
@@ -3133,125 +2686,6 @@ async def approve_payment(
     await query.answer(
         "پرداخت تایید شد."
     )
-
-    # =====================================================
-    # AUTO YOUPANEL CONFIG
-    # =====================================================
-
-    try:
-
-        plan_rows = execute(
-            """
-            SELECT *
-            FROM plans
-            WHERE id=?
-            """,
-            (payment["plan_id"],),
-            fetch=True
-        )
-
-        if not plan_rows:
-            raise RuntimeError("تعرفه سفارش پیدا نشد.")
-
-        plan = plan_rows[0]
-
-        await context.bot.send_message(
-            chat_id=payment["user_id"],
-            text=(
-                "⚙️ <b>ساخت خودکار سرویس شروع شد...</b>\n\n"
-                "لطفاً چند لحظه صبر کنید."
-            ),
-            parse_mode=ParseMode.HTML
-        )
-
-        result = await asyncio.to_thread(
-            create_youpanel_service,
-            plan
-        )
-
-        execute(
-            """
-            UPDATE purchases
-            SET status='delivered',
-                config=?,
-                delivered_at=?
-            WHERE payment_id=?
-            """,
-            (
-                result["subscription_url"],
-                now(),
-                payment_id
-            )
-        )
-
-        execute(
-            """
-            UPDATE panel
-            SET connected=1,
-                updated_at=?
-            WHERE id=1
-            """,
-            (now(),)
-        )
-
-        await context.bot.send_message(
-            chat_id=payment["user_id"],
-            text=(
-                "╭━━━ 🎉 <b>سرویس آماده شد</b> ━━━╮\n\n"
-                f"👤 نام کاربری:\n"
-                f"<code>{esc(result['username'])}</code>\n\n"
-                "🔗 لینک اشتراک:\n"
-                f"<code>{esc(result['subscription_url'])}</code>\n\n"
-                "╰━━━━━━━━━━━━━━━━━━╯"
-            ),
-            parse_mode=ParseMode.HTML
-        )
-
-    except Exception as e:
-
-        logger.exception("YOUPANEL AUTO CONFIG FAILED")
-
-        execute(
-            """
-            UPDATE purchases
-            SET status='config_failed',
-                config=?
-            WHERE payment_id=?
-            """,
-            (
-                "ERROR: " + str(e),
-                payment_id
-            )
-        )
-
-        execute(
-            """
-            UPDATE panel
-            SET connected=0,
-                updated_at=?
-            WHERE id=1
-            """,
-            (now(),)
-        )
-
-        await context.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(
-                "❌ <b>ساخت خودکار سرویس شکست خورد</b>\n\n"
-                f"🆔 پرداخت: <code>{payment_id}</code>\n\n"
-                f"خطا:\n<code>{esc(str(e)[:3500])}</code>"
-            ),
-            parse_mode=ParseMode.HTML
-        )
-
-        await context.bot.send_message(
-            chat_id=payment["user_id"],
-            text=(
-                "⚠️ پرداخت شما تأیید شده است، "
-                "اما ساخت خودکار سرویس با مشکل مواجه شد.\n"
-                "مدیر در حال بررسی است."
-            )
-        )
 
 
 async def reject_payment(
