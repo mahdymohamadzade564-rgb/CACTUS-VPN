@@ -2,143 +2,296 @@ name: CACTUS VPN Automation
 
 on:
   workflow_dispatch:
+
   push:
     branches:
       - main
+      - master
+
+  pull_request:
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
 
+concurrency:
+  group: cactus-vpn-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  MAIN_FILE: "BOT.py"
+  PACKAGE_NAME: "CACTUS-VPN-FINAL.zip"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+
 jobs:
-  cactus-vpn:
+
+  validate:
+
+    name: Validate CACTUS VPN
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 30
 
     steps:
 
+      # ==========================================================
+      # 1. CHECKOUT
+      # ==========================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
+      # ==========================================================
+      # 2. PYTHON
+      # ==========================================================
 
-      - name: Install dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # ==========================================================
+      # 3. SHOW FILES
+      # ==========================================================
+
+      - name: Inspect repository
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+          set -e
+
+          echo "========================================"
+          echo "CACTUS VPN REPOSITORY"
+          echo "========================================"
+
+          pwd
+
+          echo ""
+          echo "Files:"
+          find . \
+            -maxdepth 4 \
+            -type f \
+            -not -path "./.git/*" \
+            | sort
+
+      # ==========================================================
+      # 4. CHECK BOT.PY
+      # ==========================================================
+
+      - name: Check BOT.py
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -f "${MAIN_FILE}" ]; then
+            echo "ERROR: BOT.py was not found."
+            echo ""
+            echo "Repository files:"
+            find . \
+              -maxdepth 3 \
+              -type f \
+              -not -path "./.git/*" \
+              | sort
+
+            exit 1
           fi
 
-      - name: Validate BOT.py exists
+          echo "BOT.py found."
+
+      # ==========================================================
+      # 5. INSTALL DEPENDENCIES ONLY IF THEY EXIST
+      # ==========================================================
+
+      - name: Install Python dependencies
         shell: bash
         run: |
-          test -f BOT.py
-          echo "BOT.py found."
+          set -e
+
+          python -m pip install --upgrade pip
+
+          if [ -f "requirements.txt" ]; then
+            echo "requirements.txt found."
+            pip install -r requirements.txt
+
+          elif [ -f "pyproject.toml" ]; then
+            echo "pyproject.toml found."
+            pip install .
+
+          else
+            echo "No requirements.txt or pyproject.toml found."
+            echo "Skipping dependency installation."
+          fi
+
+      # ==========================================================
+      # 6. COMPILE
+      # ==========================================================
 
       - name: Compile BOT.py
         shell: bash
         run: |
-          python -m py_compile BOT.py
-          echo "Python compilation successful."
+          set -e
 
-      - name: Parse BOT.py AST
+          python -m py_compile "${MAIN_FILE}"
+
+          echo ""
+          echo "========================================"
+          echo "PYTHON COMPILE: SUCCESS"
+          echo "========================================"
+
+      # ==========================================================
+      # 7. AST VALIDATION
+      # ==========================================================
+
+      - name: Validate Python AST
         shell: bash
         run: |
+          set -e
+
           python - <<'PY'
           import ast
           from pathlib import Path
 
           path = Path("BOT.py")
-          source = path.read_text(encoding="utf-8")
-          ast.parse(source, filename=str(path))
+
+          source = path.read_text(
+              encoding="utf-8"
+          )
+
+          ast.parse(
+              source,
+              filename=str(path)
+          )
 
           print("AST validation successful.")
           PY
 
-      - name: Verify required functions
+      # ==========================================================
+      # 8. CHECK REQUIRED FUNCTIONS
+      # ==========================================================
+
+      - name: Check required functions
         shell: bash
         run: |
+          set -e
+
           python - <<'PY'
           import ast
           from pathlib import Path
 
           path = Path("BOT.py")
-          tree = ast.parse(path.read_text(encoding="utf-8"))
 
-          required = {
-              "create_youpanel_service",
-          }
+          source = path.read_text(
+              encoding="utf-8"
+          )
 
-          found = {
+          tree = ast.parse(
+              source,
+              filename=str(path)
+          )
+
+          functions = {
               node.name
               for node in ast.walk(tree)
-              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+              if isinstance(
+                  node,
+                  (
+                      ast.FunctionDef,
+                      ast.AsyncFunctionDef
+                  )
+              )
           }
 
-          missing = required - found
+          required = {
+              "create_youpanel_service"
+          }
+
+          missing = required - functions
 
           if missing:
-              raise SystemExit(
-                  "Missing required functions: "
-                  + ", ".join(sorted(missing))
-              )
+              print("Missing functions:")
 
-          print("Required functions verified.")
+              for item in sorted(missing):
+                  print(
+                      " -",
+                      item
+                  )
+
+              raise SystemExit(1)
+
+          print(
+              "Required functions verified."
+          )
           PY
 
-      - name: Verify configuration variables
+      # ==========================================================
+      # 9. CHECK DURATION SYSTEM
+      # ==========================================================
+
+      - name: Check duration system
         shell: bash
         run: |
+          set -e
+
           python - <<'PY'
           from pathlib import Path
 
-          source = Path("BOT.py").read_text(encoding="utf-8")
-
-          required = [
-              "BOT_TOKEN",
-              "OWNER_ID",
-              "SUPPORT_USERNAME",
-          ]
-
-          for item in required:
-              if item not in source:
-                  raise SystemExit(f"Missing configuration variable: {item}")
-
-          print("Configuration structure verified.")
-          PY
-
-      - name: Verify duration parser
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          source = Path("BOT.py").read_text(encoding="utf-8")
+          source = Path(
+              "BOT.py"
+          ).read_text(
+              encoding="utf-8"
+          )
 
           required = [
               "_parse_plan_duration",
               "_add_months",
-              "_target_expiry",
+              "_target_expiry"
           ]
+
+          missing = []
 
           for item in required:
               if item not in source:
-                  raise SystemExit(f"Missing duration helper: {item}")
+                  missing.append(item)
 
-          print("Duration helpers verified.")
+          if missing:
+              print(
+                  "Missing duration helpers:"
+              )
+
+              for item in missing:
+                  print(
+                      " -",
+                      item
+                  )
+
+              raise SystemExit(1)
+
+          print(
+              "Duration system verified."
+          )
           PY
 
-      - name: Verify diagnostics
+      # ==========================================================
+      # 10. CHECK DIAGNOSTIC SYSTEM
+      # ==========================================================
+
+      - name: Check diagnostic system
         shell: bash
         run: |
+          set -e
+
           python - <<'PY'
           from pathlib import Path
 
-          source = Path("BOT.py").read_text(encoding="utf-8")
+          source = Path(
+              "BOT.py"
+          ).read_text(
+              encoding="utf-8"
+          )
 
           required = [
               "_safe_panel_url",
@@ -146,315 +299,456 @@ jobs:
               "_save_youpanel_failure",
               "youpanel_error.txt",
               "youpanel_error.html",
-              "youpanel_error.png",
+              "youpanel_error.png"
           ]
+
+          missing = []
 
           for item in required:
               if item not in source:
-                  raise SystemExit(f"Missing diagnostic component: {item}")
+                  missing.append(item)
 
-          print("Diagnostic system verified.")
+          if missing:
+              print(
+                  "Missing diagnostic components:"
+              )
+
+              for item in missing:
+                  print(
+                      " -",
+                      item
+                  )
+
+              raise SystemExit(1)
+
+          print(
+              "Diagnostic system verified."
+          )
           PY
 
-      - name: Verify Selenium automation
+      # ==========================================================
+      # 11. CHECK SELENIUM
+      # ==========================================================
+
+      - name: Check Selenium automation
         shell: bash
         run: |
+          set -e
+
           python - <<'PY'
           from pathlib import Path
 
-          source = Path("BOT.py").read_text(encoding="utf-8")
+          source = Path(
+              "BOT.py"
+          ).read_text(
+              encoding="utf-8"
+          )
 
-          selenium_markers = [
-              "webdriver",
-              "WebDriverWait",
+          markers = [
               "selenium",
+              "webdriver",
+              "WebDriverWait"
           ]
 
-          found = any(
-              marker in source
-              for marker in selenium_markers
-          )
+          found = False
+
+          for marker in markers:
+              if marker in source:
+                  found = True
+                  break
 
           if not found:
               raise SystemExit(
-                  "Selenium automation code was not detected."
+                  "Selenium automation was not detected."
               )
 
-          print("Selenium automation detected.")
+          print(
+              "Selenium automation detected."
+          )
           PY
 
-      - name: Run tests
+      # ==========================================================
+      # 12. CHECK CONFIGURATION
+      # ==========================================================
+
+      - name: Check bot configuration
         shell: bash
         run: |
-          if [ -d tests ]; then
+          set -e
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path(
+              "BOT.py"
+          ).read_text(
+              encoding="utf-8"
+          )
+
+          required = [
+              "BOT_TOKEN",
+              "OWNER_ID",
+              "SUPPORT_USERNAME"
+          ]
+
+          for item in required:
+
+              if item not in source:
+
+                  raise SystemExit(
+                      f"Missing configuration: {item}"
+                  )
+
+          print(
+              "Bot configuration structure verified."
+          )
+          PY
+
+      # ==========================================================
+      # 13. CHECK SECRET HANDLING
+      # ==========================================================
+
+      - name: Check environment token usage
+        shell: bash
+        run: |
+          set -e
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path(
+              "BOT.py"
+          ).read_text(
+              encoding="utf-8"
+          )
+
+          if "os.getenv" not in source:
+              print(
+                  "WARNING: os.getenv was not detected."
+              )
+          else:
+              print(
+                  "Environment variable handling detected."
+              )
+          PY
+
+      # ==========================================================
+      # 14. CHECK PAYMENT ID
+      # ==========================================================
+
+      - name: Check payment correlation
+        shell: bash
+        run: |
+          set -e
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path(
+              "BOT.py"
+          ).read_text(
+              encoding="utf-8"
+          )
+
+          if "payment_id" not in source:
+              raise SystemExit(
+                  "payment_id handling was not detected."
+              )
+
+          print(
+              "Payment correlation detected."
+          )
+          PY
+
+      # ==========================================================
+      # 15. CHECK ERROR REPORTING
+      # ==========================================================
+
+      - name: Check traceback handling
+        shell: bash
+        run: |
+          set -e
+
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path(
+              "BOT.py"
+          ).read_text(
+              encoding="utf-8"
+          )
+
+          required = [
+              "traceback.format_exc",
+              "type(exc).__name__",
+              "str(exc)"
+          ]
+
+          for item in required:
+
+              if item not in source:
+
+                  raise SystemExit(
+                      "Missing error-reporting component: "
+                      + item
+                  )
+
+          print(
+              "Traceback/error reporting verified."
+          )
+          PY
+
+      # ==========================================================
+      # 16. OPTIONAL TESTS
+      # ==========================================================
+
+      - name: Run tests when available
+        shell: bash
+        run: |
+          set -e
+
+          if [ -d "tests" ]; then
+
+            echo "Tests directory found."
+
             python -m pytest -q
+
           else
-            echo "No tests directory found."
-            echo "Static validation will be used."
+
+            echo "No tests directory."
+
+            echo "Skipping pytest."
+
           fi
 
-      - name: Prepare package
+      # ==========================================================
+      # 17. CLEAN BUILD DIRECTORY
+      # ==========================================================
+
+      - name: Prepare build directory
         shell: bash
         run: |
+          set -e
+
           rm -rf build
-          rm -f cactus-vpn.zip
-          mkdir -p build/CACTUS-VPN
 
-          cp BOT.py build/CACTUS-VPN/
+          rm -f "${PACKAGE_NAME}"
 
-          if [ -f requirements.txt ]; then
-            cp requirements.txt build/CACTUS-VPN/
+          mkdir -p \
+            "build/CACTUS-VPN"
+
+      # ==========================================================
+      # 18. COPY BOT
+      # ==========================================================
+
+      - name: Copy BOT.py
+        shell: bash
+        run: |
+          set -e
+
+          cp \
+            BOT.py \
+            build/CACTUS-VPN/BOT.py
+
+      # ==========================================================
+      # 19. COPY OPTIONAL REQUIREMENTS
+      # ==========================================================
+
+      - name: Copy requirements when available
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "requirements.txt" ]; then
+
+            cp \
+              requirements.txt \
+              build/CACTUS-VPN/requirements.txt
+
           fi
 
-          if [ -f README.md ]; then
-            cp README.md build/CACTUS-VPN/
+      # ==========================================================
+      # 20. COPY README WHEN AVAILABLE
+      # ==========================================================
+
+      - name: Copy README when available
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "README.md" ]; then
+
+            cp \
+              README.md \
+              build/CACTUS-VPN/README.md
+
           fi
+
+      # ==========================================================
+      # 21. REMOVE BYTECODE
+      # ==========================================================
+
+      - name: Remove Python bytecode
+        shell: bash
+        run: |
+          set -e
+
+          find build \
+            -type d \
+            -name "__pycache__" \
+            -prune \
+            -exec rm -rf {} +
+
+          find build \
+            -type f \
+            -name "*.pyc" \
+            -delete
+
+      # ==========================================================
+      # 22. REMOVE TEMPORARY FILES
+      # ==========================================================
 
       - name: Remove temporary files
         shell: bash
         run: |
-          find build -type d -name "__pycache__" -prune -exec rm -rf {} +
-          find build -type f -name "*.pyc" -delete
-          find build -type f -name "*.log" -delete
+          set -e
+
+          find build \
+            -type f \
+            -name "*.log" \
+            -delete
+
+          find build \
+            -type f \
+            -name "*.tmp" \
+            -delete
+
+          find build \
+            -type f \
+            -name "*.bak" \
+            -delete
+
+      # ==========================================================
+      # 23. COMPILE PACKAGED BOT
+      # ==========================================================
 
       - name: Validate packaged BOT.py
         shell: bash
         run: |
-          python -m py_compile build/CACTUS-VPN/BOT.py
+          set -e
 
-      - name: Create ZIP
+          python \
+            -m py_compile \
+            build/CACTUS-VPN/BOT.py
+
+      # ==========================================================
+      # 24. CREATE ZIP
+      # ==========================================================
+
+      - name: Create final ZIP
         shell: bash
         run: |
+          set -e
+
           cd build
-          zip -r ../cactus-vpn.zip CACTUS-VPN
+
+          zip \
+            -r \
+            "../${PACKAGE_NAME}" \
+            CACTUS-VPN
+
           cd ..
 
-      - name: Verify ZIP
-        shell: bash
-        run: |
-          test -f cactus-vpn.zip
-          unzip -t cactus-vpn.zip
+      # ==========================================================
+      # 25. VERIFY ZIP
+      # ==========================================================
 
-      - name: Display package contents
+      - name: Verify ZIP integrity
         shell: bash
         run: |
-          unzip -l cactus-vpn.zip
+          set -e
+
+          test \
+            -f \
+            "${PACKAGE_NAME}"
+
+          unzip \
+            -t \
+            "${PACKAGE_NAME}"
+
+      # ==========================================================
+      # 26. SHOW ZIP
+      # ==========================================================
+
+      - name: Show final ZIP contents
+        shell: bash
+        run: |
+          set -e
+
+          unzip \
+            -l \
+            "${PACKAGE_NAME}"
+
+      # ==========================================================
+      # 27. FINAL CHECK
+      # ==========================================================
 
       - name: Final validation
         shell: bash
         run: |
-          test -f cactus-vpn.zip
-          test -f build/CACTUS-VPN/BOT.py
-          python -m py_compile build/CACTUS-VPN/BOT.py
-          echo "CACTUS VPN workflow validation completed."
+          set -e
 
-      - name: Upload CACTUS VPN package
+          test \
+            -f \
+            "${PACKAGE_NAME}"
+
+          test \
+            -f \
+            "build/CACTUS-VPN/BOT.py"
+
+          python \
+            -m py_compile \
+            "build/CACTUS-VPN/BOT.py"
+
+          echo ""
+          echo "=========================================="
+          echo "CACTUS VPN VALIDATION SUCCESSFUL"
+          echo "=========================================="
+
+      # ==========================================================
+      # 28. UPLOAD ARTIFACT
+      # ==========================================================
+
+      - name: Upload CACTUS VPN ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: CACTUS-VPN
-          path: cactus-vpn.zip
+          name: CACTUS-VPN-FINAL
+          path: CACTUS-VPN-FINAL.zip
           if-no-files-found: error
 
-# ============================================================
-# CACTUS VPN ENGINEERING DIRECTIVES
-# ============================================================
-# RULE-0001: Inspect the repository before changing source.
-# RULE-0002: Preserve existing functionality.
-# RULE-0003: Never invent selectors.
-# RULE-0004: Verify Selenium selectors from the actual DOM.
-# RULE-0005: Preserve environment-variable configuration.
-# RULE-0006: Never hard-code bot tokens.
-# RULE-0007: Never hard-code panel passwords.
-# RULE-0008: Preserve OWNER_ID.
-# RULE-0009: Preserve SUPPORT_USERNAME.
-# RULE-0010: Preserve SECOND_BOT_TOKEN.
-# RULE-0011: Preserve SECOND_CHAT_ID.
-# RULE-0012: Preserve existing payment flow.
-# RULE-0013: Preserve existing purchase storage.
-# RULE-0014: Preserve existing admin authorization.
-# RULE-0015: Preserve existing Telegram handlers.
-# RULE-0016: Preserve existing callback handlers.
-# RULE-0017: Preserve existing plan configuration.
-# RULE-0018: Preserve existing pricing logic.
-# RULE-0019: Preserve existing subscription logic.
-# RULE-0020: Preserve existing user creation logic.
-# RULE-0021: Validate Python syntax.
-# RULE-0022: Validate AST structure.
-# RULE-0023: Validate imports.
-# RULE-0024: Validate required functions.
-# RULE-0025: Validate required configuration.
-# RULE-0026: Validate Selenium presence.
-# RULE-0027: Validate duration parsing.
-# RULE-0028: Validate diagnostic handling.
-# RULE-0029: Validate ZIP contents.
-# RULE-0030: Remove temporary bytecode.
-# RULE-0031: Remove accidental logs from package.
-# RULE-0032: Never package secrets.
-# RULE-0033: Never package environment files.
-# RULE-0034: Never claim live testing without live testing.
-# RULE-0035: Never report success after an exception.
-# RULE-0036: Preserve traceback information.
-# RULE-0037: Record payment ID during automation.
-# RULE-0038: Record automation step.
-# RULE-0039: Record target expiration.
-# RULE-0040: Record exception class.
-# RULE-0041: Record exception representation.
-# RULE-0042: Save diagnostic HTML.
-# RULE-0043: Save diagnostic screenshot.
-# RULE-0044: Redact password input values.
-# RULE-0045: Sanitize panel URLs.
-# RULE-0046: Preserve page title.
-# RULE-0047: Prefer WebDriverWait.
-# RULE-0048: Avoid arbitrary long sleeps.
-# RULE-0049: Verify page navigation.
-# RULE-0050: Verify form visibility.
-# RULE-0051: Verify username field.
-# RULE-0052: Verify volume field.
-# RULE-0053: Verify expiry field.
-# RULE-0054: Verify group selection.
-# RULE-0055: Verify submit control.
-# RULE-0056: Verify created user.
-# RULE-0057: Verify subscription URL.
-# RULE-0058: Treat date picker as UI.
-# RULE-0059: Do not blindly send text to date picker.
-# RULE-0060: Open verified date picker.
-# RULE-0061: Read active calendar.
-# RULE-0062: Determine target month.
-# RULE-0063: Navigate month only through verified controls.
-# RULE-0064: Select exact target day.
-# RULE-0065: Verify selected day.
-# RULE-0066: Open verified time picker.
-# RULE-0067: Read visible time choices.
-# RULE-0068: Select target hour.
-# RULE-0069: Select target minute.
-# RULE-0070: Verify selected time.
-# RULE-0071: Never silently select a different date.
-# RULE-0072: Never silently select a different time.
-# RULE-0073: Fail descriptively when picker cannot represent target.
-# RULE-0074: Preserve calendar arithmetic.
-# RULE-0075: Normalize Persian digits.
-# RULE-0076: Normalize Arabic digits.
-# RULE-0077: Accept ASCII digits.
-# RULE-0078: Accept Persian day units.
-# RULE-0079: Accept English day units.
-# RULE-0080: Accept Persian month units.
-# RULE-0081: Accept English month units.
-# RULE-0082: Accept Persian year units.
-# RULE-0083: Accept English year units.
-# RULE-0084: Reject zero duration.
-# RULE-0085: Reject negative duration.
-# RULE-0086: Reject malformed duration.
-# RULE-0087: Default unit to days when appropriate.
-# RULE-0088: Preserve calendar month boundaries.
-# RULE-0089: Preserve leap-year behavior.
-# RULE-0090: Preserve valid destination dates.
-# RULE-0091: Preserve current time unless UI requires otherwise.
-# RULE-0092: Pass payment ID into service creation.
-# RULE-0093: Update step before every major Selenium phase.
-# RULE-0094: Log failures with context.
-# RULE-0095: Save diagnostics before re-raising.
-# RULE-0096: Keep caller exception handling intact.
-# RULE-0097: Store concise purchase errors.
-# RULE-0098: Keep complete traceback on disk.
-# RULE-0099: Never expose credentials in logs.
-# RULE-0100: Never expose tokens in artifacts.
-# RULE-0101: Verify login success.
-# RULE-0102: Verify users page.
-# RULE-0103: Verify add-user page.
-# RULE-0104: Verify generated username.
-# RULE-0105: Verify data limit.
-# RULE-0106: Verify expiry.
-# RULE-0107: Verify groups.
-# RULE-0108: Verify creation.
-# RULE-0109: Verify lookup.
-# RULE-0110: Verify subscription.
-# RULE-0111: Preserve Telegram success message.
-# RULE-0112: Preserve Telegram failure message.
-# RULE-0113: Preserve owner notifications.
-# RULE-0114: Preserve user notifications.
-# RULE-0115: Preserve payment status.
-# RULE-0116: Preserve database schema.
-# RULE-0117: Preserve JSON schema.
-# RULE-0118: Preserve file paths.
-# RULE-0119: Preserve encoding.
-# RULE-0120: Preserve Persian text.
-# RULE-0121: Preserve RTL behavior where applicable.
-# RULE-0122: Check exception boundaries.
-# RULE-0123: Check finally blocks.
-# RULE-0124: Check indentation.
-# RULE-0125: Check imports.
-# RULE-0126: Check regular expressions.
-# RULE-0127: Check f-strings.
-# RULE-0128: Check string literals.
-# RULE-0129: Check async functions.
-# RULE-0130: Check await usage.
-# RULE-0131: Check thread offloading.
-# RULE-0132: Check Selenium driver lifecycle.
-# RULE-0133: Check driver cleanup.
-# RULE-0134: Check timeout configuration.
-# RULE-0135: Check page load behavior.
-# RULE-0136: Check stale element handling.
-# RULE-0137: Check timeout handling.
-# RULE-0138: Check click interception handling.
-# RULE-0139: Check element visibility.
-# RULE-0140: Check element presence.
-# RULE-0141: Check element enabled state.
-# RULE-0142: Scroll verified elements into view.
-# RULE-0143: Do not delete arbitrary overlays.
-# RULE-0144: Close only verified overlays.
-# RULE-0145: Re-find elements after DOM changes.
-# RULE-0146: Avoid stale references.
-# RULE-0147: Verify URL after navigation.
-# RULE-0148: Verify title after navigation.
-# RULE-0149: Verify known page element after navigation.
-# RULE-0150: Stop when navigation is incorrect.
-# RULE-0151: Do not continue on wrong page.
-# RULE-0152: Capture current URL on failure.
-# RULE-0153: Capture page title on failure.
-# RULE-0154: Capture page source on failure.
-# RULE-0155: Capture screenshot on failure.
-# RULE-0156: Capture full traceback.
-# RULE-0157: Preserve exception type.
-# RULE-0158: Preserve original exception cause.
-# RULE-0159: Use RuntimeError only with useful context.
-# RULE-0160: Avoid blank Message output.
-# RULE-0161: Use repr fallback for empty exception text.
-# RULE-0162: Keep diagnostic filenames stable.
-# RULE-0163: Make diagnostics UTF-8.
-# RULE-0164: Make source UTF-8.
-# RULE-0165: Use safe filesystem operations.
-# RULE-0166: Handle missing driver safely.
-# RULE-0167: Handle missing page source safely.
-# RULE-0168: Handle screenshot failure safely.
-# RULE-0169: Handle diagnostic-write failure safely.
-# RULE-0170: Never hide diagnostic-write errors from logs.
-# RULE-0171: Keep build reproducible.
-# RULE-0172: Start packaging from clean directory.
-# RULE-0173: Remove stale package before build.
-# RULE-0174: Validate archive after creation.
-# RULE-0175: Validate packaged source.
-# RULE-0176: Upload final artifact.
-# RULE-0177: Use GitHub Actions v4 checkout.
-# RULE-0178: Use GitHub Actions v5 setup-python.
-# RULE-0179: Use artifact upload v4.
-# RULE-0180: Use explicit Python version.
-# RULE-0181: Use pip upgrade.
-# RULE-0182: Install requirements when available.
-# RULE-0183: Do not fail solely because requirements.txt is absent.
-# RULE-0184: Fail when BOT.py is absent.
-# RULE-0185: Fail on Python syntax errors.
-# RULE-0186: Fail on AST syntax errors.
-# RULE-0187: Fail on missing required functions.
-# RULE-0188: Fail on invalid package.
-# RULE-0189: Fail on missing artifact.
-# RULE-0190: Preserve repository contents.
-# RULE-0191: Do not overwrite source during workflow.
-# RULE-0192: Do not commit generated artifacts automatically.
-# RULE-0193: Do not push secrets.
-# RULE-0194: Do not print secrets.
-# RULE-0195: Do not echo tokens.
-# RULE-0196: Do not echo passwords.
-# RULE-0197: Do not echo cookies.
-# RULE-0198: Do not echo authorization headers.
-# RULE-0199: Do not echo environment secrets.
-# RULE-0200: Complete workflow validation before artifact upload.
+      # ==========================================================
+      # 29. SUMMARY
+      # ==========================================================
+
+      - name: Create workflow summary
+        shell: bash
+        run: |
+          {
+            echo "# CACTUS VPN"
+            echo ""
+            echo "## Validation"
+            echo ""
+            echo "- Python syntax: PASS"
+            echo "- AST validation: PASS"
+            echo "- Required functions: PASS"
+            echo "- Diagnostic system: PASS"
+            echo "- Selenium detection: PASS"
+            echo "- Package creation: PASS"
+            echo "- ZIP integrity: PASS"
+            echo ""
+            echo "## Artifact"
+            echo ""
+            echo "\`${PACKAGE_NAME}\`"
+            echo ""
+            echo "Live YouPanel automation is not claimed unless a real panel test was executed."
+          } >> "$GITHUB_STEP_SUMMARY"
