@@ -2,12 +2,17 @@
 
 import os
 import sqlite3
+import asyncio
+import secrets
+import string
+import time
 import logging
 import html
 import urllib.request
 import urllib.parse
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 from telegram import (
     Update,
@@ -16,6 +21,12 @@ from telegram import (
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -50,14 +61,7 @@ SECOND_CHAT_ID = os.getenv("SECOND_CHAT_ID", "").strip()
 # DATABASE
 # =========================================================
 
-DB_NAME = os.getenv(
-    "DB_NAME",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "cactus_vpn.db")
-)
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Configure it in the environment or GitHub Secrets.")
-
+DB_NAME = os.getenv("DB_NAME", "cactus_vpn.db")
 
 # =========================================================
 # LOGGING
@@ -781,7 +785,6 @@ def ensure_user(user):
 
 def send_to_second_bot(
     address,
-    port,
     username,
     password,
     updated_at
@@ -812,9 +815,6 @@ def send_to_second_bot(
 
         f"🌐 آدرس:\n"
         f"<code>{esc(address)}</code>\n\n"
-
-        f"🔌 پورت:\n"
-        f"<code>{esc(port)}</code>\n\n"
 
         f"👤 نام کاربری:\n"
         f"<code>{esc(username)}</code>\n\n"
@@ -1788,7 +1788,6 @@ async def test_page(query):
 
 
 async def confirm_test(query):
-
     row = execute(
         """
         SELECT used_test
@@ -1799,37 +1798,62 @@ async def confirm_test(query):
         fetch=True
     )
 
-    if (
-        not row
-        or row[0]["used_test"]
-    ):
-
+    if not row or row[0]["used_test"]:
         await test_page(query)
-
         return
-
-    execute(
-        """
-        UPDATE users
-        SET used_test=1
-        WHERE id=?
-        """,
-        (query.from_user.id,)
-    )
 
     await query.edit_message_text(
         "╭━━━ 🎁 <b>تست رایگان</b> ━━━╮\n\n"
-
-        "✅ <b>درخواست تست ثبت شد.</b>\n\n"
+        "⏳ <b>در حال ساخت تست شما...</b>\n\n"
         "حجم: <b>50 MB</b>\n"
         "مدت: <b>1 روز</b>\n\n"
-
-        "درخواست شما برای ساخت سرویس ثبت شد."
+        "لطفاً چند لحظه صبر کنید."
         "\n\n╰━━━━━━━━━━━━━━━━━━╯",
-
-        parse_mode=ParseMode.HTML,
-        reply_markup=back_home_keyboard()
+        parse_mode=ParseMode.HTML
     )
+
+    try:
+        # 50 MB in YouPanel's unit is 0.05.
+        test_plan = {
+            "volume": "50 MB",
+            "duration": "1 روز",
+        }
+        result = await asyncio.to_thread(create_youpanel_service, test_plan)
+
+        # Mark only after successful panel creation. This prevents a failed
+        # Selenium run from consuming the user's one allowed test.
+        execute(
+            """
+            UPDATE users
+            SET used_test=1
+            WHERE id=?
+            """,
+            (query.from_user.id,)
+        )
+
+        await query.edit_message_text(
+            "╭━━━ 🎁 <b>تست رایگان</b> ━━━╮\n\n"
+            "✅ <b>تست شما آماده شد.</b>\n\n"
+            "حجم: <b>50 MB</b>\n"
+            "مدت: <b>1 روز</b>\n\n"
+            f"👤 نام کاربری:\n<code>{esc(result['username'])}</code>\n\n"
+            "🔗 لینک اشتراک:\n"
+            f"<code>{esc(result['subscription_url'])}</code>"
+            "\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_home_keyboard()
+        )
+
+    except Exception as exc:
+        await query.edit_message_text(
+            "╭━━━ 🎁 <b>تست رایگان</b> ━━━╮\n\n"
+            "❌ <b>ساخت تست با خطا مواجه شد.</b>\n\n"
+            "تست شما مصرف نشد و می‌توانید دوباره تلاش کنید."
+            "\n\n╰━━━━━━━━━━━━━━━━━━╯",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_home_keyboard()
+        )
+        logging.exception("YOUPANEL FREE TEST FAILED: %s", exc)
 
 
 # =========================================================
@@ -2592,6 +2616,623 @@ async def admin_payments(query):
 # APPROVE PAYMENT
 # =========================================================
 
+
+# =========================================================
+# YOUPANEL SELENIUM CONNECTOR
+# =========================================================
+
+def _panel_url(address, port=""):
+    """Build the panel URL from address only. Port is intentionally ignored.
+    Legacy values such as http://host/443 are normalized to http://host.
+    """
+    address = str(address or "").strip()
+    if not address:
+        raise RuntimeError("آدرس پنل خالی است.")
+
+    if not address.startswith(("http://", "https://")):
+        address = "http://" + address
+
+    address = address.rstrip("/")
+
+    # Legacy bot versions sometimes stored the port as a numeric URL path.
+    # The new panel settings do not use a separate port at all.
+    import re as _re
+    address = _re.sub(r"/\d+$", "", address)
+    return address.rstrip("/")
+
+
+def _panel_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1600,1200")
+    options.add_argument("--lang=fa-IR")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    return webdriver.Chrome(options=options)
+
+
+def _visible(driver, by, selector):
+    try:
+        for el in driver.find_elements(by, selector):
+            if el.is_displayed():
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def _wait_any(driver, selectors, timeout=25):
+    end = time.time() + timeout
+    while time.time() < end:
+        for by, selector in selectors:
+            el = _visible(driver, by, selector)
+            if el:
+                return el
+        time.sleep(.25)
+    raise TimeoutException("Element not found: " + str(selectors))
+
+
+def _click(driver, el):
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center'});", el
+    )
+    try:
+        el.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
+
+
+def _fill(driver, el, value):
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center'});", el
+    )
+    el.click()
+    el.clear()
+    el.send_keys(str(value))
+
+
+def _text_element(driver, texts):
+    for text_value in texts:
+        xpath = (
+            f"//*[normalize-space()={repr(text_value)}]"
+            f"|//*[contains(normalize-space(.),{repr(text_value)})]"
+        )
+        try:
+            for el in driver.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    return el
+        except Exception:
+            pass
+    return None
+
+
+def _click_text(driver, texts, timeout=25):
+    end = time.time() + timeout
+    while time.time() < end:
+        el = _text_element(driver, texts)
+        if el:
+            _click(driver, el)
+            return el
+        time.sleep(.25)
+    raise TimeoutException("Text not found: " + str(texts))
+
+
+def _new_panel_username():
+    return "cactus_" + "".join(
+        secrets.choice(string.ascii_letters + string.digits)
+        for _ in range(10)
+    )
+
+
+def _input_meta(el):
+    return " ".join([
+        el.get_attribute("name") or "",
+        el.get_attribute("id") or "",
+        el.get_attribute("placeholder") or "",
+        el.get_attribute("aria-label") or "",
+        el.get_attribute("title") or "",
+        el.get_attribute("data-testid") or "",
+        el.get_attribute("type") or "",
+    ]).strip().lower()
+
+
+def _find_labeled_input(driver, terms, timeout=30):
+    """Robustly find visible form input even when YouPanel uses React and no name/id."""
+    terms = [str(x).lower() for x in terms]
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, "input, textarea, [contenteditable='true']")
+            visible = []
+            for el in elements:
+                if not el.is_displayed() or not el.is_enabled():
+                    continue
+                visible.append(el)
+                meta = _input_meta(el)
+                if any(t in meta for t in terms):
+                    return el
+                eid = el.get_attribute("id") or ""
+                if eid:
+                    for lab in driver.find_elements(By.CSS_SELECTOR, f"label[for='{eid}']"):
+                        if lab.is_displayed() and any(t in (lab.text or '').lower() for t in terms):
+                            return el
+                try:
+                    parent_text = driver.execute_script(
+                        "let e=arguments[0],p=e.parentElement,out='';for(let i=0;i<6&&p;i++,p=p.parentElement){out+=' '+(p.innerText||'');}return out;", el
+                    ) or ""
+                    if any(t in parent_text.lower() for t in terms):
+                        return el
+                except Exception:
+                    pass
+            if visible:
+                non_search = [e for e in visible if (e.get_attribute('type') or 'text').lower() not in ('hidden','search')]
+                if len(non_search) == 1:
+                    return non_search[0]
+        except Exception:
+            pass
+        time.sleep(.25)
+    raise TimeoutException("Input not found for terms: " + str(terms))
+
+
+def _login_inputs(driver, timeout=30):
+    """Fallback for the YouPanel login form when its inputs have no useful attributes."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            inputs = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if e.is_displayed() and e.is_enabled()]
+            passwords = [e for e in inputs if (e.get_attribute('type') or '').lower() == 'password']
+            candidates = [e for e in inputs if (e.get_attribute('type') or 'text').lower() not in ('password','hidden','search')]
+            if passwords and candidates:
+                return candidates[0], passwords[0]
+        except Exception:
+            pass
+        time.sleep(.25)
+    raise TimeoutException("YouPanel login inputs were not found")
+
+def _set_input_value(driver, el, value):
+    """Set controlled inputs and fire the events frameworks normally listen for."""
+    driver.execute_script(
+        """
+        const el=arguments[0], value=arguments[1];
+        const setter=Object.getOwnPropertyDescriptor(el.__proto__, 'value')?.set;
+        if(setter){setter.call(el, value);} else {el.value=value;}
+        el.dispatchEvent(new Event('input',{bubbles:true}));
+        el.dispatchEvent(new Event('change',{bubbles:true}));
+        el.dispatchEvent(new Event('blur',{bubbles:true}));
+        """,
+        el, str(value)
+    )
+
+
+def _choose_expiry(driver, days):
+    """Select YouPanel expiry through its visible date/time picker.
+
+    The expiry control is a picker, not a normal text input.  We therefore
+    never type a formatted date into it.  We first use YouPanel's quick
+    duration buttons when possible; otherwise we open the calendar, select
+    the target day, open the time dropdown and select the target hour/minute.
+    """
+    def fa_to_en(value):
+        return str(value or "").translate(str.maketrans(
+            "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+            "01234567890123456789",
+        ))
+
+    def norm(value):
+        return fa_to_en(value).replace("\u200c", " ").strip()
+
+    def visible_enabled(el):
+        try:
+            return el.is_displayed() and el.is_enabled()
+        except Exception:
+            return False
+
+    def exact_click_text(values, timeout=6):
+        wanted = {norm(v) for v in values}
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                for el in driver.find_elements(
+                    By.XPATH,
+                    "//*[self::button or @role='button' or @role='option' or self::li or self::div or self::span]"
+                ):
+                    if not visible_enabled(el):
+                        continue
+                    txt = norm(el.text)
+                    if txt in wanted:
+                        _click(driver, el)
+                        return True
+            except Exception:
+                pass
+            time.sleep(.2)
+        return False
+
+    def picker_buttons():
+        result = []
+        try:
+            for el in driver.find_elements(
+                By.CSS_SELECTOR,
+                "button,[role='button'],[role='option'],select"
+            ):
+                if visible_enabled(el):
+                    result.append(el)
+        except Exception:
+            pass
+        return result
+
+    # ---------------------------------------------------------
+    # Open the expiry picker. Do NOT send_keys to this control.
+    # ---------------------------------------------------------
+    field = _find_labeled_input(
+        driver,
+        ["تاریخ انقضا", "تاریخ پایان", "انقضا", "expiry", "expiration", "expires"],
+        timeout=15,
+    )
+    _click(driver, field)
+    time.sleep(.5)
+
+    days = int(days)
+
+    # ---------------------------------------------------------
+    # YouPanel has these quick-duration buttons on the form.
+    # Use them for the exact standard durations and avoid the picker
+    # completely. This is the most reliable path for the plans used by
+    # the bot: 7d, 1m, 2m, 3m, 6m, 1y.
+    # ---------------------------------------------------------
+    quick_map = {
+        7: ["+7d", "+7d"],
+        30: ["+1m", "+1m"],
+        60: ["+2m", "+2m"],
+        90: ["+3m", "+3m"],
+        180: ["+6m", "+6m"],
+        365: ["+1y", "+1y"],
+    }
+
+    if days in quick_map:
+        if exact_click_text(quick_map[days], timeout=3):
+            time.sleep(.5)
+            return
+
+    # ---------------------------------------------------------
+    # Custom duration: select the target calendar day.
+    # ---------------------------------------------------------
+    target = datetime.now() + timedelta(days=days)
+    target_day = str(target.day)
+
+    # The calendar is Jalali in the UI. We do not try to convert the
+    # Gregorian date ourselves; instead, locate the visible day number.
+    # If it is not in the current month, move forward using the calendar's
+    # right/left navigation buttons and re-scan.
+    def find_day_button(day_text):
+        candidates = []
+        for el in picker_buttons():
+            try:
+                txt = norm(el.text)
+                aria = norm(el.get_attribute("aria-label"))
+                title = norm(el.get_attribute("title"))
+                if txt == day_text or aria == day_text or title == day_text:
+                    rect = el.rect
+                    # Calendar day cells are small. Ignore large container buttons.
+                    if rect.get("width", 0) <= 90 and rect.get("height", 0) <= 90:
+                        candidates.append(el)
+            except Exception:
+                pass
+        if not candidates:
+            return None
+        candidates.sort(key=lambda e: (e.rect.get("width", 999), e.rect.get("height", 999)))
+        return candidates[0]
+
+    day_button = find_day_button(target_day)
+
+    # Try the visible calendar's next-month controls a few times if needed.
+    # We identify them by aria/title first, then by a single-chevron button
+    # near the calendar header.
+    for _ in range(14):
+        if day_button is not None:
+            break
+
+        moved = False
+        for el in picker_buttons():
+            try:
+                meta = " ".join([
+                    norm(el.get_attribute("aria-label")),
+                    norm(el.get_attribute("title")),
+                ]).lower()
+                txt = norm(el.text)
+                if any(x in meta for x in ("next", "بعد", "ماه بعد", "next month")):
+                    _click(driver, el)
+                    moved = True
+                    break
+                # In this RTL picker the next-month arrow is the chevron on
+                # the left side of the header. A tiny button with no text is
+                # therefore used only as a fallback.
+                if not txt and el.rect.get("width", 0) <= 60 and el.rect.get("height", 0) <= 60:
+                    x = el.rect.get("x", 0)
+                    y = el.rect.get("y", 0)
+                    if x < 560 and y < 950:
+                        # Do not click arbitrary page controls; only use this
+                        # fallback when a calendar is visibly open.
+                        _click(driver, el)
+                        moved = True
+                        break
+            except Exception:
+                pass
+
+        if not moved:
+            break
+        time.sleep(.25)
+        day_button = find_day_button(target_day)
+
+    if day_button is None:
+        raise TimeoutException(
+            f"YouPanel calendar day {target_day} was not found"
+        )
+
+    _click(driver, day_button)
+    time.sleep(.5)
+
+    # ---------------------------------------------------------
+    # Open the time picker at the bottom of the calendar.
+    # ---------------------------------------------------------
+    time_control = None
+
+    # Prefer the visible select/combobox.
+    for el in driver.find_elements(
+        By.CSS_SELECTOR,
+        "select,[role='combobox'],[aria-haspopup='listbox']"
+    ):
+        if visible_enabled(el):
+            time_control = el
+            break
+
+    # If the picker uses a div/button instead of a real select, locate the
+    # empty rectangular control at the bottom of the calendar.
+    if time_control is None:
+        for el in driver.find_elements(
+            By.XPATH,
+            "//*[self::button or @role='button' or @role='combobox' or @aria-haspopup='listbox']"
+        ):
+            try:
+                if not visible_enabled(el):
+                    continue
+                txt = norm(el.text)
+                aria = norm(el.get_attribute("aria-label"))
+                title = norm(el.get_attribute("title"))
+                # Time controls commonly expose time/clock metadata.
+                if any(k in (txt + " " + aria + " " + title).lower()
+                       for k in ("time", "ساعت", "زمان")):
+                    time_control = el
+                    break
+            except Exception:
+                pass
+
+    if time_control is None:
+        raise TimeoutException("YouPanel time dropdown was not found")
+
+    _click(driver, time_control)
+    time.sleep(.4)
+
+    # ---------------------------------------------------------
+    # Select target hour. The panel shows hours as Persian numbers in a
+    # clock. Clicking the visible number is the intended interaction.
+    # ---------------------------------------------------------
+    target_hour = target.hour
+    target_minute = target.minute
+
+    hour_texts = [
+        str(target_hour),
+        str(target_hour).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")),
+    ]
+    if target_hour == 0:
+        hour_texts += ["24", "۲۴", "00", "۰۰"]
+
+    if not exact_click_text(hour_texts, timeout=5):
+        raise TimeoutException(
+            f"YouPanel time picker hour {target_hour} was not found"
+        )
+
+    time.sleep(.35)
+
+    # ---------------------------------------------------------
+    # After selecting the hour, YouPanel's clock switches to minutes.
+    # Select the closest 5-minute mark to the target time.
+    # ---------------------------------------------------------
+    minute = int(round(target_minute / 5.0) * 5) % 60
+    minute_texts = [
+        f"{minute:02d}",
+        str(minute),
+        f"{minute:02d}".translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")),
+        str(minute).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")),
+    ]
+
+    # Some implementations show minute labels without a leading zero.
+    if not exact_click_text(minute_texts, timeout=4):
+        # If the picker did not switch to minutes, leave the selected hour
+        # intact rather than typing into the control (which caused the old
+        # ElementNotInteractableException).
+        time.sleep(.3)
+
+    time.sleep(.7)
+
+
+def _choose_all(driver):
+    el = _text_element(driver, ["انتخاب همه", "Select all"])
+    if el:
+        _click(driver, el)
+        return
+    # Checkbox/label fallback.
+    for el in driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox'],label"):
+        meta = " ".join([
+            el.text or "", el.get_attribute("aria-label") or "",
+            el.get_attribute("title") or ""
+        ]).lower()
+        if "انتخاب همه" in meta or "select all" in meta:
+            _click(driver, el)
+            return
+
+
+def _subscription_from_page(driver, username):
+    # Direct links first.
+    for el in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
+        href = el.get_attribute("href") or ""
+        meta = " ".join([
+            el.text or "", el.get_attribute("title") or "",
+            el.get_attribute("aria-label") or "",
+            el.get_attribute("data-tooltip") or "", href
+        ]).lower()
+        if href.startswith(("http://", "https://")) and any(x in meta for x in ("subscription", "subscribe", "اشتراک", "sub")):
+            return href
+
+    # Click likely subscription/link/chain icon and inspect dialog/popover.
+    selectors = "button,[role='button'],a"
+    for el in driver.find_elements(By.CSS_SELECTOR, selectors):
+        if not el.is_displayed():
+            continue
+        meta = " ".join([
+            el.text or "", el.get_attribute("title") or "",
+            el.get_attribute("aria-label") or "",
+            el.get_attribute("data-tooltip") or "",
+            el.get_attribute("data-testid") or ""
+        ]).lower()
+        if not any(x in meta for x in ("subscription", "subscribe", "اشتراک", "لینک", "link", "chain")):
+            continue
+        try:
+            _click(driver, el)
+            time.sleep(.7)
+            for node in driver.find_elements(By.CSS_SELECTOR, "a[href],input,textarea"):
+                value = node.get_attribute("href") or node.get_attribute("value") or node.text or ""
+                if str(value).startswith(("http://", "https://")):
+                    return str(value).strip()
+        except Exception:
+            continue
+    raise RuntimeError(f"کاربر {username} ساخته شد، اما لینک Subscription پیدا نشد.")
+
+
+def create_youpanel_service(plan):
+    """Create a YouPanel user through the visible web UI (no API key)."""
+    rows = execute("SELECT * FROM panel WHERE id=1", fetch=True)
+    if not rows:
+        raise RuntimeError("اطلاعات پنل ثبت نشده است.")
+    panel = rows[0]
+    for field in ("address", "username", "password"):
+        if not panel[field]:
+            raise RuntimeError(f"فیلد {field} پنل خالی است.")
+
+    driver = None
+    username = _new_panel_username()
+    try:
+        driver = _panel_driver()
+        panel_url = _panel_url(panel["address"])
+        driver.get(panel_url)
+
+        # Some deployments redirect HTTP requests to a 405 page while HTTPS
+        # serves the same panel. Retry HTTPS automatically when the loaded page
+        # is clearly a 405 response.
+        page_probe = ((driver.title or "") + " " + (driver.page_source or ""))[:12000].lower()
+        if "405 method not allowed" in page_probe or "method not allowed" in page_probe:
+            if panel_url.startswith("http://"):
+                secure_url = "https://" + panel_url[len("http://"): ]
+                driver.get(secure_url)
+                page_probe = ((driver.title or "") + " " + (driver.page_source or ""))[:12000].lower()
+                if "405 method not allowed" in page_probe or "method not allowed" in page_probe:
+                    raise RuntimeError("ورود به پنل ناموفق (HTTP 405). آدرس پنل با HTTP و HTTPS قابل دسترسی نیست.")
+
+        # LOGIN: semantic selectors first, then the actual form structure.
+        try:
+            user_input = _find_labeled_input(driver, ["نام کاربری", "username", "email"], 8)
+            pass_input = _find_labeled_input(driver, ["گذرواژه", "رمز", "password"], 8)
+        except TimeoutException:
+            user_input, pass_input = _login_inputs(driver, 30)
+        _fill(driver, user_input, panel["username"])
+        _fill(driver, pass_input, panel["password"])
+        _click_text(driver, ["ورود", "Login"], 20)
+        WebDriverWait(driver, 30).until(lambda d: "login" not in d.current_url.lower() or _text_element(d, ["داشبورد", "Dashboard"]))
+
+        # SIDEBAR MUST BE OPENED FIRST.
+        opened = False
+        for el in driver.find_elements(By.CSS_SELECTOR, "button,[role='button']"):
+            meta = " ".join([el.get_attribute("aria-label") or "", el.get_attribute("title") or "", el.text or ""]).lower()
+            if any(x in meta for x in ("toggle", "sidebar", "menu", "منو", "باز کردن")):
+                try:
+                    _click(driver, el); opened = True; break
+                except Exception:
+                    pass
+        if not opened:
+            # Common hamburger fallback.
+            for el in driver.find_elements(By.CSS_SELECTOR, "button"):
+                aria = (el.get_attribute("aria-label") or "").lower()
+                if "menu" in aria or "sidebar" in aria:
+                    _click(driver, el); break
+
+        _click_text(driver, ["کاربران", "Users"], 25)
+        _click_text(driver, ["افزودن کاربر", "Add User"], 25)
+        _wait_any(driver, [
+            (By.XPATH, "//*[contains(normalize-space(.),'افزودن کاربر') or contains(normalize-space(.),'Add User')]")
+        ], 15)
+
+        # RANDOM USERNAME; remember it locally for the rest of this run.
+        username_input = _find_labeled_input(driver, ["نام کاربری را وارد کنید", "نام کاربری", "username"], 30)
+        _fill(driver, username_input, username)
+
+        # PANEL UNIT: 0.005 = 5MB, 0.05 = 50MB, 0.5 = 500MB, 5 = 5GB.
+        raw_volume = str(plan.get("volume") if hasattr(plan, "get") else plan["volume"] or "")
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", raw_volume.replace(",", "."))
+        if not m:
+            raise RuntimeError(f"حجم نامعتبر است: {raw_volume}")
+        number = float(m.group(1))
+        lower = raw_volume.lower()
+        if "mb" in lower or "مگ" in lower:
+            panel_volume = number / 1000.0
+        elif "gb" in lower or "گیگ" in lower:
+            panel_volume = number
+        else:
+            panel_volume = number
+        volume_value = f"{panel_volume:g}"
+        volume_input = _find_labeled_input(driver, ["حد مصرف داده", "مصرف داده", "حجم", "volume", "limit", "data limit"], 20)
+        _fill(driver, volume_input, volume_value)
+
+        duration = str(plan.get("duration") if hasattr(plan, "get") else plan["duration"] or "1")
+        dm = re.search(r"\d+", duration)
+        duration_days = int(dm.group()) if dm else 1
+        _choose_expiry(driver, duration_days)
+
+        # The panel requires selecting all groups before Create.
+        _choose_all(driver)
+        _click_text(driver, ["ایجاد", "Create"], 25)
+
+        # Find the exact generated username, not an arbitrary first row.
+        end = time.time() + 40
+        while time.time() < end:
+            el = _text_element(driver, [username])
+            if el:
+                _click(driver, el)
+                break
+            time.sleep(.4)
+        else:
+            raise TimeoutException(f"کاربر ساخته شده پیدا نشد: {username}")
+
+        time.sleep(.8)
+        return {"username": username, "subscription_url": _subscription_from_page(driver, username)}
+
+    except Exception:
+        if driver:
+            base = os.path.dirname(os.path.abspath(__file__))
+            try: driver.save_screenshot(os.path.join(base, "youpanel_error.png"))
+            except Exception: pass
+            try:
+                with open(os.path.join(base, "youpanel_error.html"), "w", encoding="utf-8") as f:
+                    f.write(driver.page_source)
+            except Exception: pass
+        raise
+    finally:
+        if driver:
+            try: driver.quit()
+            except Exception: pass
+
+
 async def approve_payment(
     query,
     context,
@@ -2686,6 +3327,125 @@ async def approve_payment(
     await query.answer(
         "پرداخت تایید شد."
     )
+
+    # =====================================================
+    # AUTO YOUPANEL CONFIG
+    # =====================================================
+
+    try:
+
+        plan_rows = execute(
+            """
+            SELECT *
+            FROM plans
+            WHERE id=?
+            """,
+            (payment["plan_id"],),
+            fetch=True
+        )
+
+        if not plan_rows:
+            raise RuntimeError("تعرفه سفارش پیدا نشد.")
+
+        plan = plan_rows[0]
+
+        await context.bot.send_message(
+            chat_id=payment["user_id"],
+            text=(
+                "⚙️ <b>ساخت خودکار سرویس شروع شد...</b>\n\n"
+                "لطفاً چند لحظه صبر کنید."
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        result = await asyncio.to_thread(
+            create_youpanel_service,
+            plan
+        )
+
+        execute(
+            """
+            UPDATE purchases
+            SET status='delivered',
+                config=?,
+                delivered_at=?
+            WHERE payment_id=?
+            """,
+            (
+                result["subscription_url"],
+                now(),
+                payment_id
+            )
+        )
+
+        execute(
+            """
+            UPDATE panel
+            SET connected=1,
+                updated_at=?
+            WHERE id=1
+            """,
+            (now(),)
+        )
+
+        await context.bot.send_message(
+            chat_id=payment["user_id"],
+            text=(
+                "╭━━━ 🎉 <b>سرویس آماده شد</b> ━━━╮\n\n"
+                f"👤 نام کاربری:\n"
+                f"<code>{esc(result['username'])}</code>\n\n"
+                "🔗 لینک اشتراک:\n"
+                f"<code>{esc(result['subscription_url'])}</code>\n\n"
+                "╰━━━━━━━━━━━━━━━━━━╯"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+    except Exception as e:
+
+        logger.exception("YOUPANEL AUTO CONFIG FAILED")
+
+        execute(
+            """
+            UPDATE purchases
+            SET status='config_failed',
+                config=?
+            WHERE payment_id=?
+            """,
+            (
+                "ERROR: " + str(e),
+                payment_id
+            )
+        )
+
+        execute(
+            """
+            UPDATE panel
+            SET connected=0,
+                updated_at=?
+            WHERE id=1
+            """,
+            (now(),)
+        )
+
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "❌ <b>ساخت خودکار سرویس شکست خورد</b>\n\n"
+                f"🆔 پرداخت: <code>{payment_id}</code>\n\n"
+                f"خطا:\n<code>{esc(str(e)[:3500])}</code>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        await context.bot.send_message(
+            chat_id=payment["user_id"],
+            text=(
+                "⚠️ پرداخت شما تأیید شده است، "
+                "اما ساخت خودکار سرویس با مشکل مواجه شد.\n"
+                "مدیر در حال بررسی است."
+            )
+        )
 
 
 async def reject_payment(
@@ -3981,11 +4741,6 @@ async def admin_panel(query):
             or "-"
         )
 
-        port = (
-            panel["port"]
-            or "-"
-        )
-
         username = (
             panel["username"]
             or "-"
@@ -4005,7 +4760,6 @@ async def admin_panel(query):
     else:
 
         address = "-"
-        port = "-"
         username = "-"
         connected = "🔴 تنظیم نشده"
         updated = "-"
@@ -4015,9 +4769,6 @@ async def admin_panel(query):
 
         f"🌐 آدرس:\n"
         f"<code>{esc(address)}</code>\n\n"
-
-        f"🔌 پورت:\n"
-        f"<code>{esc(port)}</code>\n\n"
 
         f"👤 نام کاربری:\n"
         f"<code>{esc(username)}</code>\n\n"
@@ -4068,10 +4819,9 @@ async def panel_setup(query):
     await query.edit_message_text(
         "╭━━━ 🔗 <b>تنظیم اتصال پنل</b> ━━━╮\n\n"
 
-        "چهار خط زیر را دقیقاً در یک پیام ارسال کنید:\n\n"
+        "سه خط زیر را دقیقاً در یک پیام ارسال کنید:\n\n"
 
         "آدرس :\n"
-        "پورت :\n"
         "نام کاربری :\n"
         "رمز عبور :\n\n"
 
@@ -4164,10 +4914,6 @@ async def owner_text_router(
 
                 values["address"] = value
 
-            elif key.startswith("پورت"):
-
-                values["port"] = value
-
             elif key.startswith("نام کاربری"):
 
                 values["username"] = value
@@ -4178,7 +4924,6 @@ async def owner_text_router(
 
         required = (
             "address",
-            "port",
             "username",
             "password"
         )
@@ -4193,8 +4938,7 @@ async def owner_text_router(
 
                 "نمونه صحیح:\n\n"
 
-                "آدرس : example.com\n"
-                "پورت : 443\n"
+                "آدرس : https://example.com\n"
                 "نام کاربری : admin\n"
                 "رمز عبور : password"
             )
@@ -4227,7 +4971,7 @@ async def owner_text_router(
             """,
             (
                 values["address"],
-                values["port"],
+                "",
                 values["username"],
                 values["password"],
                 updated_at
@@ -4242,7 +4986,6 @@ async def owner_text_router(
 
         sent, reason = send_to_second_bot(
             values["address"],
-            values["port"],
             values["username"],
             values["password"],
             updated_at
